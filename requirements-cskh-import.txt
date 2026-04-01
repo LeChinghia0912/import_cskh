@@ -1,0 +1,9 @@
+pandas
+openpyxl
+python-dotenv
+SQLAlchemy
+PyMySQL
+rapidfuzz
+Unidecode
+bcrypt
+
