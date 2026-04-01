@@ -389,14 +389,46 @@ def parse_created_at(value: Any, sheet_month: int, sheet_year: int) -> Optional[
     except Exception:
         return None
 
-# Map workflow status from sheet status
+# Map workflow status from sheet column B (TRẠNG THÁI)
 def map_workflow_status(sheet_status: str) -> str:
+    raw = (sheet_status or "").strip()
+    if not raw or raw.lower() == "nan":
+        return "received"
+
+    # "!!!" = Dừng hỗ trợ (_normalize_text bỏ dấu ! nên phải check raw)
+    compact = re.sub(r"\s+", "", raw)
+    # Excel đôi khi dùng ký tự unicode như ❗/‼, hoặc user nhập "!! !"
+    # Chỉ cần chuỗi sau khi bỏ khoảng trắng là toàn dấu chấm than (>=3 ký tự) thì coi là stopped.
+    if (
+        "!!!" in raw
+        or compact == "!!!"
+        or (len(compact) >= 3 and re.fullmatch(r"[!！‼❗]+", compact) is not None)
+    ):
+        return "stopped"
+
     s = _normalize_text(sheet_status)
 
     if "ko nghe may" in s or "khong nghe may" in s:
         return "not_answered"
 
-    return "completed" if (sheet_status or "").strip() else "received"
+    # Đã tiếp nhận (received): Chờ, Đang xử lý, Chưa LL, Lưu ý, Xử lý sau, ...
+    if s == "cho" or s.startswith("cho "):
+        return "received"
+    if "dang xu ly" in s:
+        return "received"
+    if "chua ll" in s:
+        return "received"
+    if "luu y" in s:
+        return "received"
+    if "xu ly sau" in s:
+        return "received"
+
+    # OK = hoàn thành trên sheet
+    if s == "ok":
+        return "completed"
+
+    # Nhãn lạ → received (tránh đổ hết vào completed, làm cột Kanban "Đã tiếp nhận" trống)
+    return "received"
 
 
 def insert_cskh_solution_from_handling(
@@ -513,6 +545,7 @@ def import_excel(
     ensure_cskh_status_code(engine4, "received", expected_id=1)
     ensure_cskh_status_code(engine4, "completed")
     ensure_cskh_status_code(engine4, "not_answered")
+    ensure_cskh_status_code(engine4, "stopped")
 
     ticket_cols = set(get_table_columns(engine4, "cskh_tickets"))
     transfer_cols = set(get_table_columns(engine4, "cskh_ticket_transfers"))
@@ -554,10 +587,7 @@ def import_excel(
         try:
             customer_id = upsert_customer_and_phone(engine4, customer_name, phone_raw)
 
-            # Status mapping:
-            # - Nếu cột B chứa "Ko nghe máy" / "Không nghe máy" => not_answered
-            # - Nếu cột B có text khác => completed
-            # - Nếu cột B rỗng => received
+            # Status mapping (cột B): xem map_workflow_status()
             workflow_status = map_workflow_status(sheet_status)
 
             product_id, product_canonical, product_score = match_product(product_index, product_raw)
@@ -702,27 +732,51 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Import CSKH tickets from Excel to mysql4.cskh_tickets (map products from mysql3.products).")
     parser.add_argument("--excel", required=True, help="Path to Excel file")
     parser.add_argument("--sheet", default=None, help="Excel sheet name (default: first sheet)")
+    parser.add_argument(
+        "--all-sheets",
+        action="store_true",
+        help="Import từng sheet trong file; sheet tên không đúng dạng T{tháng}{năm} (vd T12025) sẽ bị bỏ qua",
+    )
     parser.add_argument("--start-row", type=int, default=0, help="0-based data row index (excluding header). Default 0.")
     parser.add_argument("--dry-run", action="store_true", help="Parse and validate only; do not write to DB")
     parser.add_argument("--fallback-created-by", type=int, default=None, help="User id to use when receiver is empty or receiver is 'Kỹ thuật'")
     parser.add_argument("--tech-department-name", default="Kỹ thuật", help="cskh_receiving_departments.description to use/create for 'Kỹ thuật'")
     args = parser.parse_args()
 
+    if args.all_sheets and args.sheet is not None:
+        raise SystemExit("Chỉ dùng một trong hai: --all-sheets hoặc --sheet, không dùng cùng lúc.")
+
     load_dotenv()
 
     engine3 = create_engine(build_mysql_url("DB3"), pool_pre_ping=True, future=True)
     engine4 = create_engine(build_mysql_url("DB4"), pool_pre_ping=True, future=True)
 
-    import_excel(
-        engine3=engine3,
-        engine4=engine4,
-        excel_path=args.excel,
-        sheet_name=args.sheet,
-        start_row=args.start_row,
-        dry_run=args.dry_run,
-        fallback_created_by=args.fallback_created_by,
-        tech_department_name=args.tech_department_name,
-    )
+    def run_one(sheet: Optional[str]) -> None:
+        import_excel(
+            engine3=engine3,
+            engine4=engine4,
+            excel_path=args.excel,
+            sheet_name=sheet,
+            start_row=args.start_row,
+            dry_run=args.dry_run,
+            fallback_created_by=args.fallback_created_by,
+            tech_department_name=args.tech_department_name,
+        )
+
+    if args.all_sheets:
+        xls = pd.ExcelFile(args.excel)
+        for sn in xls.sheet_names:
+            print(f"\n================= Sheet: {sn!r} ==================")
+            try:
+                run_one(sn)
+            except RuntimeError as e:
+                msg = str(e)
+                if "không đúng định dạng" in msg or "không hợp lệ" in msg:
+                    print(f"SKIP sheet: {msg}")
+                    continue
+                raise
+    else:
+        run_one(args.sheet)
 
 
 if __name__ == "__main__":
