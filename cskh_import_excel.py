@@ -389,11 +389,135 @@ def parse_created_at(value: Any, sheet_month: int, sheet_year: int) -> Optional[
     except Exception:
         return None
 
-# Map workflow status from sheet column B (TRẠNG THÁI)
+
+def _header_label(cell: Any) -> str:
+    if cell is None or (isinstance(cell, float) and pd.isna(cell)):
+        return ""
+    s = str(cell).strip()
+    return "" if not s or s.lower() == "nan" else s
+
+
+def classify_excel_header(label: str) -> Optional[str]:
+    """
+    Map dòng tiêu đề Excel (table.column) → khóa nội bộ.
+    None = không dùng cho import có cấu trúc mới.
+    """
+    t = _header_label(label)
+    if not t:
+        return None
+    low = re.sub(r"\s+", " ", t.lower())
+    if low in ("cskh_tickets.created_at", "tickets.created_at"):
+        return "created_at"
+    if low == "cskh_status.code":
+        return "status_code"
+    if low == "cskh_customers.name":
+        return "customer_name"
+    if low == "cskh_customer_phones.phone":
+        return "phone"
+    if low == "cskh_tickets.issue_content":
+        return "issue_content"
+    if low == "cskh_tickets.handling":
+        return "handling"
+    if low == "cskh_solutions.resolution_text":
+        return "resolution_text"
+    if low == "users.full_name":
+        return "receiver_name"
+    if low == "cskh_tickets.source":
+        return "source"
+    if low == "cskh_receiving_departments.id":
+        return "receiving_department_id"
+    if low == "cskh_tickets.notes":
+        return "notes"
+    if low == "cskh_tickets.product_text":
+        return "product_text_raw"
+    n = _normalize_text(t)
+    if "tinh" in n and "thanh" in n:
+        return "province"
+    return None
+
+
+def build_column_map(df: pd.DataFrame) -> Tuple[Dict[str, int], bool]:
+    """
+    Đọc map cột từ tên cột (dòng 1 trong Excel khi header=0).
+    Trả về (map khóa nội bộ -> chỉ số cột, header_mode).
+    header_mode=True khi nhận diện đủ file export mới (có issue_content + created_at tối thiểu).
+    """
+    m: Dict[str, int] = {}
+    for j, col in enumerate(df.columns):
+        key = classify_excel_header(col)
+        if key and key not in m:
+            m[key] = j
+    # Định dạng mới: có cột issue_content theo tên bảng (không còn E=product cố định).
+    header_mode = "created_at" in m and "issue_content" in m and "customer_name" in m
+    return m, header_mode
+
+
+def parse_optional_int_id(value: Any) -> Optional[int]:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float) and not pd.isna(value):
+        if value == int(value):
+            return int(value)
+    s = str(value).strip()
+    if not s or s.lower() == "nan":
+        return None
+    if re.fullmatch(r"\d+", s):
+        return int(s)
+    try:
+        f = float(s)
+        if f == int(f):
+            return int(f)
+    except ValueError:
+        pass
+    return None
+
+
+_LEGACY_COL_INDEX: Dict[str, int] = {
+    "created_at": 0,
+    "status_code": 1,
+    "customer_name": 2,
+    "phone": 3,
+    "product_text_raw": 4,
+    "issue_content": 5,
+    "handling": 6,
+    "receiver_name": 7,
+    "source": 8,
+}
+
+
+def get_row_field(row: pd.Series, field: str, col_map: Dict[str, int], header_mode: bool) -> Any:
+    if header_mode:
+        j = col_map.get(field)
+        if j is None:
+            return None
+        return row.iloc[j]
+    j = _LEGACY_COL_INDEX.get(field)
+    if j is None or j >= len(row):
+        return None
+    return row.iloc[j]
+
+
+def str_cell(v: Any) -> str:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    s = str(v).strip()
+    return "" if s.lower() == "nan" else s
+
+
+# Map workflow status from sheet column B (TRẠNG THÁI) hoặc cskh_status.code
 def map_workflow_status(sheet_status: str) -> str:
     raw = (sheet_status or "").strip()
     if not raw or raw.lower() == "nan":
         return "received"
+
+    # Mã workflow trực tiếp (DB / API)
+    code = re.sub(r"\s+", "", raw.lower())
+    if code in ("received", "completed", "not_answered", "stopped"):
+        return code
 
     # "!!!" = Dừng hỗ trợ (_normalize_text bỏ dấu ! nên phải check raw)
     compact = re.sub(r"\s+", "", raw)
@@ -410,6 +534,10 @@ def map_workflow_status(sheet_status: str) -> str:
 
     if "ko nghe may" in s or "khong nghe may" in s:
         return "not_answered"
+
+    # Trạng thái hiển thị / mô tả (cskh_status) thường gặp
+    if "hoan thanh" in s or s == "hoan thanh":
+        return "completed"
 
     # Đã tiếp nhận (received): Chờ, Đang xử lý, Chưa LL, Lưu ý, Xử lý sau, ...
     if s == "cho" or s.startswith("cho "):
@@ -431,17 +559,17 @@ def map_workflow_status(sheet_status: str) -> str:
     return "received"
 
 
-def insert_cskh_solution_from_handling(
+def insert_cskh_solution_resolution(
     conn: Any,
     solution_cols: set,
     ticket_id: int,
-    handling: str,
+    resolution_text: str,
     created_at: Optional[datetime],
     workflow_status: str,
     completed_status_id: Optional[int],
 ) -> None:
-    """Ghi cột G (tình trạng xử lý) vào cskh_solutions.resolution_text, không dùng cskh_tickets.handling."""
-    txt = (handling or "").strip()
+    """Ghi `resolution_text` vào bảng cskh_solutions (nếu có nội dung)."""
+    txt = (resolution_text or "").strip()
     if not txt:
         return
     if "ticket_id" not in solution_cols or "resolution_text" not in solution_cols:
@@ -521,19 +649,21 @@ def import_excel(
 
     df = pd.read_excel(xls, sheet_name=actual_sheet_name, header=0)
 
+    col_map, header_mode = build_column_map(df)
+    print("Excel column mode:", "header (dòng 1 = table.column)" if header_mode else "legacy (A..I theo vị trí)")
+
     # Lấy tháng/năm từ tên sheet, ví dụ T12025 => tháng 1, năm 2025
     sheet_month, sheet_year = parse_sheet_month_year(actual_sheet_name)
 
-    # Cột A bị merge trong Excel:
-    # pandas chỉ đọc giá trị ở dòng đầu tiên, các dòng dưới sẽ là NaN
-    # => dùng ffill để đổ ngày xuống các dòng trống bên dưới
-    df.iloc[:, 0] = df.iloc[:, 0].ffill()
-
-    # Normalize column names like Excel: A,B,C... but user uses positions
-    # Expect at least columns A..I
-    needed = 9
-    if df.shape[1] < needed:
-        raise RuntimeError(f"Excel needs at least {needed} columns (A..I). Found: {df.shape[1]}")
+    # Cột ngày bị merge trong Excel → ffill theo đúng cột `created_at`
+    if header_mode:
+        j_ct = col_map.get("created_at")
+        if j_ct is not None:
+            df.iloc[:, j_ct] = df.iloc[:, j_ct].ffill()
+    else:
+        if df.shape[1] < 9:
+            raise RuntimeError(f"Excel định dạng cũ cần ít nhất 9 cột (A..I). Found: {df.shape[1]}")
+        df.iloc[:, 0] = df.iloc[:, 0].ffill()
 
     product_index = build_product_index(engine3)
 
@@ -562,41 +692,67 @@ def import_excel(
     for i in range(start_row, len(df)):
         row = df.iloc[i]
 
-        created_at = parse_created_at(row.iloc[0], sheet_month, sheet_year)  # A
-        sheet_status = str(row.iloc[1]).strip() if row.iloc[1] is not None else ""  # B
-        customer_name = str(row.iloc[2]).strip() if row.iloc[2] is not None else ""  # C
-        phone_raw = row.iloc[3]  # D
-        # E: sản phẩm — NaN / trống coi như không có (product_text & product_id = NULL)
-        _pr = row.iloc[4]
-        if _pr is None or (isinstance(_pr, float) and pd.isna(_pr)):
-            product_raw = ""
-        else:
-            product_raw = str(_pr).strip()
-            if product_raw.lower() == "nan":
-                product_raw = ""
-        issue_content = str(row.iloc[5]).strip() if row.iloc[5] is not None else ""  # F
-        handling = str(row.iloc[6]).strip() if row.iloc[6] is not None else ""  # G
-        receiver_name = str(row.iloc[7]).strip() if row.iloc[7] is not None else ""  # H
-        source = str(row.iloc[8]).strip() if row.iloc[8] is not None else ""  # I
+        created_at = parse_created_at(
+            get_row_field(row, "created_at", col_map, header_mode),
+            sheet_month,
+            sheet_year,
+        )
+        sheet_status = str_cell(get_row_field(row, "status_code", col_map, header_mode))
+        customer_name = str_cell(get_row_field(row, "customer_name", col_map, header_mode))
+        phone_raw = get_row_field(row, "phone", col_map, header_mode)
+        product_raw = str_cell(get_row_field(row, "product_text_raw", col_map, header_mode))
+        issue_content = str_cell(get_row_field(row, "issue_content", col_map, header_mode))
+        handling_for_ticket = str_cell(get_row_field(row, "handling", col_map, header_mode)) if header_mode else ""
+        resolution_for_solution = (
+            str_cell(get_row_field(row, "resolution_text", col_map, header_mode))
+            if header_mode
+            else str_cell(get_row_field(row, "handling", col_map, header_mode))
+        )
+        receiver_name = str_cell(get_row_field(row, "receiver_name", col_map, header_mode))
+        source = str_cell(get_row_field(row, "source", col_map, header_mode))
+        notes_excel = str_cell(get_row_field(row, "notes", col_map, header_mode))
+        province_txt = str_cell(get_row_field(row, "province", col_map, header_mode))
+        sheet_dept_id = (
+            parse_optional_int_id(get_row_field(row, "receiving_department_id", col_map, header_mode))
+            if header_mode
+            else None
+        )
 
-        # Skip empty lines
-        if not any([customer_name, normalize_vn_phone(phone_raw), product_raw, issue_content, handling, receiver_name, source, created_at]):
+        nv = normalize_vn_phone(phone_raw)
+        if not any(
+            [
+                created_at,
+                customer_name,
+                nv,
+                product_raw,
+                issue_content,
+                handling_for_ticket,
+                resolution_for_solution,
+                receiver_name,
+                source,
+                notes_excel,
+                province_txt,
+            ]
+        ):
             skipped += 1
             continue
 
         try:
             customer_id = upsert_customer_and_phone(engine4, customer_name, phone_raw)
 
-            # Status mapping (cột B): xem map_workflow_status()
+            # Status mapping (cột trạng thái / cskh_status.code): xem map_workflow_status()
             workflow_status = map_workflow_status(sheet_status)
 
             product_id, product_canonical, product_score = match_product(product_index, product_raw)
 
-            notes_parts = []
-            if sheet_status:
-                notes_parts.append(f"Trạng thái sheet: {sheet_status}")
-
-            notes = "\n".join(notes_parts) if notes_parts else None
+            notes_lines: List[str] = []
+            if notes_excel:
+                notes_lines.append(notes_excel)
+            if province_txt:
+                notes_lines.append(f"Tỉnh/Thành: {province_txt}")
+            if not header_mode and sheet_status:
+                notes_lines.append(f"Trạng thái sheet: {sheet_status}")
+            notes = "\n".join(notes_lines) if notes_lines else None
 
             is_tech = _normalize_text(receiver_name) == _normalize_text("Kỹ thuật")
 
@@ -627,9 +783,8 @@ def import_excel(
                 ticket_payload["product_id"] = int(product_id) if product_id is not None else None
             if "issue_content" in ticket_cols:
                 ticket_payload["issue_content"] = issue_content or None
-            # Cột G → cskh_solutions.resolution_text (không lưu handling trên ticket)
             if "handling" in ticket_cols:
-                ticket_payload["handling"] = None
+                ticket_payload["handling"] = (handling_for_ticket or None) if header_mode else None
             if "source" in ticket_cols:
                 ticket_payload["source"] = (source[:32] if source else None)
             if "notes" in ticket_cols:
@@ -637,9 +792,19 @@ def import_excel(
             if "created_by" in ticket_cols:
                 ticket_payload["created_by"] = created_by
             if "receiving_department_id" in ticket_cols:
-                ticket_payload["receiving_department_id"] = (tech_dept_id if is_tech else None)
+                if sheet_dept_id is not None:
+                    ticket_payload["receiving_department_id"] = sheet_dept_id
+                elif is_tech:
+                    ticket_payload["receiving_department_id"] = tech_dept_id
+                else:
+                    ticket_payload["receiving_department_id"] = None
             if "current_department_id" in ticket_cols:
-                ticket_payload["current_department_id"] = (tech_dept_id if is_tech else None)
+                if sheet_dept_id is not None:
+                    ticket_payload["current_department_id"] = sheet_dept_id
+                elif is_tech:
+                    ticket_payload["current_department_id"] = tech_dept_id
+                else:
+                    ticket_payload["current_department_id"] = None
             if "created_at" in ticket_cols:
                 ticket_payload["created_at"] = created_at
             if "updated_at" in ticket_cols:
@@ -662,11 +827,11 @@ def import_excel(
                 res = conn.execute(text(f"INSERT INTO cskh_tickets ({col_sql}) VALUES ({val_sql})"), ticket_payload)
                 ticket_id = int(res.lastrowid)
 
-                insert_cskh_solution_from_handling(
+                insert_cskh_solution_resolution(
                     conn,
                     solution_cols,
                     ticket_id,
-                    handling,
+                    resolution_for_solution,
                     created_at,
                     workflow_status,
                     completed_status_id,
@@ -674,12 +839,15 @@ def import_excel(
 
                 activity_meta: Dict[str, Any] = {
                     "import": "excel",
+                    "header_mode": header_mode,
                     "sheet_status": sheet_status or None,
                     "product_raw": product_raw or None,
                     "product_id": product_id,
                     "product_name": product_canonical,
                     "product_score": product_score,
                     "source": source or None,
+                    "resolution_text": resolution_for_solution or None,
+                    "handling": (handling_for_ticket or None) if header_mode else None,
                 }
                 insert_ticket_activity_if_possible(
                     engine4=engine4,
