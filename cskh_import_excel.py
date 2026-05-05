@@ -5,7 +5,7 @@ import re
 import secrets
 import string
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
@@ -41,10 +41,474 @@ def normalize_vn_phone(raw: Any) -> str:
     s = str(raw).strip()
     if not s:
         return ""
-    digits = re.sub(r"\D+", "", s)
-    if digits.startswith("84") and len(digits) >= 10:
-        digits = "0" + digits[2:]
-    return digits
+    digit_only = re.sub(r"\D+", "", s)
+    if digit_only.startswith("84") and len(digit_only) >= 10:
+        digit_only = "0" + digit_only[2:]
+    # Một ô có thể chứa nhiều SĐT (vd "0356...; 0964...") — chuẩn hóa match dùng số đầu tiên.
+    found = re.findall(r"0\d{9}", digit_only)
+    if found:
+        return found[0]
+    return digit_only
+
+
+def _collapse_digits_to_vn10(raw_digits: str) -> Optional[str]:
+    """Chuỗi chỉ gồm chữ số -> một SĐT trong nước 10 số (0xxxxxxxxx) nếu hợp lệ."""
+    if not raw_digits:
+        return None
+    d = raw_digits
+    if d.startswith("84") and len(d) >= 11:
+        d = "0" + d[2:13]
+    if len(d) == 9 and d[0] in "35789":
+        d = "0" + d
+    if len(d) >= 10 and d[0] == "0":
+        cand = d[:10]
+        if re.fullmatch(r"0\d{9}", cand):
+            return cand
+    return None
+
+
+def _read_spaced_local_phone(s: str, start: int) -> Optional[Tuple[int, str]]:
+    """
+    Từ vị trí `start` (ký tự '0'), đọc đủ 10 chữ số (cho phép khoảng trắng/gạch/giữa các số).
+    Trả về (index_ký_tự_sau_cùng_của_SĐT, phone10) hoặc None.
+    """
+    if start >= len(s) or s[start] != "0":
+        return None
+    j = start
+    digits: List[str] = []
+    while j < len(s) and len(digits) < 10:
+        if s[j].isdigit():
+            digits.append(s[j])
+            j += 1
+        elif s[j] in " \t\u00a0.-+/" and digits:
+            j += 1
+        else:
+            break
+    if len(digits) != 10:
+        return None
+    phone = "".join(digits)
+    if not re.fullmatch(r"0\d{9}", phone):
+        return None
+    return j, phone
+
+
+def _read_plus84_phone(s: str, start: int) -> Optional[Tuple[int, str]]:
+    """Đọc +84... / 084... -> SĐT 10 số trong nước."""
+    if s.startswith("+84", start):
+        j = start + 3
+    elif s.startswith("084", start):
+        j = start + 3
+    else:
+        return None
+    while j < len(s) and s[j] in " \t\u00a0-":
+        j += 1
+    d: List[str] = []
+    while j < len(s) and len(d) < 11:
+        if s[j].isdigit():
+            d.append(s[j])
+        elif s[j] in " \t\u00a0.-/" and d:
+            pass
+        else:
+            break
+        j += 1
+    raw = "".join(d)
+    phone = _collapse_digits_to_vn10(raw)
+    if not phone:
+        return None
+    return j, phone
+
+
+def _read_nine_digit_mobile(s: str, start: int) -> Optional[Tuple[int, str]]:
+    """9 chữ số liền, bắt đầu 3/5/7/8/9 — thường là thiếu số 0 đầu (vd 948283559)."""
+    if start + 9 > len(s):
+        return None
+    if start > 0 and s[start - 1] == "0":
+        return None
+    if not re.match(r"^[35789]\d{8}$", s[start : start + 9]):
+        return None
+    if start > 0 and s[start - 1].isdigit():
+        return None
+    if start + 9 < len(s) and s[start + 9].isdigit():
+        return None
+    return start + 9, "0" + s[start : start + 9]
+
+
+def find_all_vn_phone_spans(s: str) -> List[Tuple[int, int, str]]:
+    """Các đoạn (start, end, phone10) trong chuỗi, trái sang phải, không chồng lấn."""
+    out: List[Tuple[int, int, str]] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        hit: Optional[Tuple[int, int, str]] = None
+        if i + 3 <= n and (s.startswith("+84", i) or s.startswith("084", i)):
+            r84 = _read_plus84_phone(s, i)
+            if r84:
+                end_j, ph = r84
+                hit = (i, end_j, ph)
+        elif s[i] == "0" and i + 1 < n and s[i + 1].isdigit():
+            r0 = _read_spaced_local_phone(s, i)
+            if r0:
+                end_j, ph = r0
+                hit = (i, end_j, ph)
+        elif i + 9 <= n:
+            r9 = _read_nine_digit_mobile(s, i)
+            if r9:
+                end_j, ph = r9
+                hit = (i, end_j, ph)
+        if hit:
+            st, en, ph = hit
+            out.append((st, en, ph))
+            i = en
+            continue
+        i += 1
+    return out
+
+
+def preprocess_customer_name_cell_for_parse(s: str) -> str:
+    """Chuẩn bị chuỗi: gộp khoảng trắng; bỏ ngoặc bao quanh SĐT cuối ô (vd \"Tên ( 0365... )\")."""
+    t = (s or "").strip()
+    if not t:
+        return ""
+    t = re.sub(r"\s+", " ", t)
+    # "Name ( 0365 889 168 )" hoặc "(+84 911 ...)" ở cuối -> đưa SĐT ra ngoài ngoặc
+    t = re.sub(
+        r"\(\s*((?:\+84|084|0)[\d\s\.\-+]{8,24})\s*\)\s*$",
+        lambda m: " " + m.group(1).replace(" ", " ").strip() + " ",
+        t,
+    )
+    return t.strip()
+
+
+def split_combined_customer_cell(combined: str) -> Tuple[str, str]:
+    """
+    Tách (tên, sđt) khi cuối chuỗi là SĐT VN 10 số (bắt đầu 0), phía trước có khoảng trắng/gạch ngang.
+    Ví dụ: "Phạm Văn Long 0394789468" -> ("Phạm Văn Long", "0394789468")
+    """
+    s = preprocess_customer_name_cell_for_parse(combined or "")
+    if not s:
+        return "", ""
+    m = re.match(r"^(.*)[\s\u00a0\-–—]+(0[\d\s\.\-]{8,22})\s*$", s)
+    if m:
+        tail = re.sub(r"\D", "", m.group(2))
+        phone = _collapse_digits_to_vn10(tail)
+        if phone:
+            name = m.group(1).strip()
+            return name, phone
+    m2 = re.match(r"^(.*)[\s\u00a0\-–—]+(\+84[\d\s\.\-+]{8,24})\s*$", s)
+    if m2:
+        tail = re.sub(r"\D", "", m2.group(2))
+        if tail.startswith("84"):
+            tail = "0" + tail[2:]
+        phone = _collapse_digits_to_vn10(tail[:12])
+        if phone:
+            return m2.group(1).strip(), phone
+    return s, ""
+
+
+def parse_contacts_from_combined_cell(combined: str) -> Tuple[List[Tuple[str, str]], str]:
+    """
+    Tách nhiều cặp (tên, SĐT) và phần đuôi không gắn SĐt (đưa vào notes khi import).
+
+    Quét SĐT: +84, 0xxxx (có khoảng giữa các số), 9 số thiếu 0 (không nằm sau chữ 0).
+    Fallback: tách theo `/` từng đoạn có SĐT ở cuối.
+    """
+    s0 = preprocess_customer_name_cell_for_parse(combined or "")
+    if not s0:
+        return [], ""
+
+    spans = find_all_vn_phone_spans(s0)
+    if spans:
+        contacts: List[Tuple[str, str]] = []
+        cursor = 0
+        for st, en, ph in spans:
+            chunk = s0[cursor:st]
+            chunk = re.sub(r"[\s/|,:;–—\-]+$", "", chunk)
+            chunk = re.sub(r"^[\s/|,:;–—\-]+", "", chunk).strip()
+            contacts.append((chunk, ph))
+            cursor = en
+        tail = s0[cursor:].strip()
+        tail = re.sub(r"^[\s\-–—/+|]+", "", tail)
+        fixed: List[Tuple[str, str]] = []
+        for nm, p in contacts:
+            if not nm.strip() and p:
+                fixed.append(("", p))
+            else:
+                fixed.append((nm.strip(), p))
+        if len(fixed) >= 2 and all(not n for n, _ in fixed):
+            phones_only = [p for _, p in fixed if p]
+            if phones_only:
+                return [( "", p) for p in phones_only], tail
+        return fixed, tail
+
+    parts = [p.strip() for p in re.split(r"\s*/\s*", s0) if p.strip()]
+    if not parts:
+        return [], ""
+    out: List[Tuple[str, str]] = []
+    for p in parts:
+        n, ph = split_combined_customer_cell(p)
+        if ph:
+            out.append((n, ph))
+        else:
+            out.append((p.strip(), ""))
+    return out, ""
+
+
+def _tail_is_extra_person_name_not_description(tail: str) -> bool:
+    """Đuôi sau SĐT cuối: nếu giống tên người thì gộp vào tên KH; nếu giống mô tả dịch vụ thì để notes."""
+    t = (tail or "").strip()
+    if not t or re.search(r"\d", t):
+        return False
+    if len(t) > 48:
+        return False
+    n = _normalize_text(t)
+    if any(
+        x in n
+        for x in (
+            "ho tro",
+            "may loc",
+            "hotro",
+            "mayloc",
+            "ho tro may",
+            "xu ly",
+            "bao hanh",
+        )
+    ):
+        return False
+    if len(t.split()) > 8:
+        return False
+    return True
+
+
+def apply_customer_column_split_for_import(customer_name: str, phone_raw: Any) -> Tuple[str, Any, str]:
+    """
+    Chuẩn hóa cặp (tên, sđt) kiểu legacy: cột C dính số (nhiều người `/`, `-`, +84, ngoặc, SĐT có khoảng trắng…), cột D có thể trống.
+    - Quét mọi SĐT trong ô; gộp tên; đuôi giống tên phụ (không chứa số, không giống mô tả \"hỗ trợ/máy lọc\") gộp vào tên.
+    - D trống: ghi các SĐT vào D cách \"; \" (normalize_vn_phone lấy SĐT đầu cho DB).
+    - D đã có: giữ D; phần còn lại có thể ghi notes.
+    """
+    c = str_cell(customer_name)
+    d_plain = str_cell(phone_raw)
+    contacts, tail_remainder = parse_contacts_from_combined_cell(c)
+    if not contacts:
+        return c, phone_raw, ""
+
+    names_joined = " / ".join(n for n, _ in contacts if n)
+    phones_known = [p for _, p in contacts if p and len(p) == 10]
+    if not names_joined and phones_known:
+        names_joined = " / ".join(phones_known)
+
+    tr = tail_remainder.strip() if tail_remainder else ""
+    if tr and _tail_is_extra_person_name_not_description(tr):
+        names_joined = f"{names_joined} / {tr}".strip(" /") if names_joined else tr
+        tr = ""
+
+    note_bits: List[str] = []
+    if tr:
+        note_bits.append(f"Mô tả/ghi chú kèm trong ô: {tr}")
+
+    if d_plain:
+        name_out = names_joined if phones_known else c
+        extras: List[str] = []
+        for n, p in contacts[1:]:
+            if p:
+                extras.append(f"{n} — {p}" if n else p)
+            elif n:
+                extras.append(n)
+        if extras:
+            note_bits.append("Thêm từ cột khách: " + "; ".join(extras))
+        extra = "\n".join(note_bits) if note_bits else ""
+        return name_out, phone_raw, extra
+
+    if not phones_known:
+        extra = "\n".join(note_bits) if note_bits else ""
+        return (names_joined or c), phone_raw, extra
+
+    phone_str: str = phones_known[0] if len(phones_known) == 1 else "; ".join(phones_known)
+    extra = "\n".join(note_bits) if note_bits else ""
+    return (names_joined or c), phone_str, extra
+
+
+def normalize_excel_customer_columns(
+    excel_path: str,
+    sheet_name: Optional[str],
+    out_path: str,
+    all_sheets: bool,
+    also_merge_created_at: bool = True,
+) -> None:
+    """
+    Ghi file Excel mới: tách tên/SĐT ở cột khách hàng (legacy C hoặc cskh_customers.name),
+    điền cột SĐT (legacy D / cskh_customer_phones.phone) khi đang trống.
+    Mặc định sau đó gộp luôn cột ngày tạo trên cùng file out (logic merge như --merge-created-at-out).
+    """
+    xls = pd.ExcelFile(excel_path)
+    target_sheets = list(xls.sheet_names) if all_sheets else [sheet_name or xls.sheet_names[0]]
+
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        for sn in xls.sheet_names:
+            df = pd.read_excel(xls, sheet_name=sn, header=0).copy()
+            if sn not in target_sheets:
+                df.to_excel(writer, sheet_name=sn, index=False)
+                continue
+
+            col_map, header_mode = build_column_map(df)
+            j_name = col_map.get("customer_name") if header_mode else 2
+            j_phone = col_map.get("phone") if header_mode else 3
+
+            if header_mode and (j_name is None or j_phone is None):
+                print(f"Sheet {sn!r}: không map được customer_name/phone — giữ nguyên.")
+                df.to_excel(writer, sheet_name=sn, index=False)
+                continue
+            if not header_mode and df.shape[1] < 4:
+                print(f"Sheet {sn!r}: ít hơn 4 cột — giữ nguyên.")
+                df.to_excel(writer, sheet_name=sn, index=False)
+                continue
+
+            for i in range(len(df)):
+                orig_c = df.iat[i, j_name]
+                orig_d = df.iat[i, j_phone] if j_phone < df.shape[1] else None
+                c0 = str_cell(orig_c)
+                new_c, new_d, _ = apply_customer_column_split_for_import(c0, orig_d)
+                df.iat[i, j_name] = new_c
+                df.iat[i, j_phone] = new_d
+
+            df.to_excel(writer, sheet_name=sn, index=False)
+
+    if also_merge_created_at:
+        merge_excel_created_at_column(
+            excel_path=out_path,
+            sheet_name=sheet_name,
+            out_path=out_path,
+            all_sheets=all_sheets,
+        )
+
+
+def _detect_created_at_column_1based(ws: Any) -> int:
+    """Cột Excel 1-based: tiêu đề `cskh_tickets.created_at` / `tickets.created_at`; không thấy thì cột A (1)."""
+    mc = int(ws.max_column or 1)
+    for c in range(1, mc + 1):
+        lab = _header_label(ws.cell(row=1, column=c).value)
+        if classify_excel_header(lab) == "created_at":
+            return c
+    return 1
+
+
+def _merge_date_key_for_cells(v: Any) -> Optional[str]:
+    """Khóa so sánh để gộp các dòng cùng \"ngày hiệu lực\" sau ffill."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    if isinstance(v, datetime):
+        return v.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(v, date):
+        return datetime(v.year, v.month, v.day).strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(v, pd.Timestamp):
+        if pd.isna(v):
+            return None
+        return pd.Timestamp(v).strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        try:
+            from openpyxl.utils.datetime import from_excel
+
+            dt = from_excel(float(v))
+            if isinstance(dt, datetime):
+                return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+    s = str(v).strip()
+    if not s or s.lower() == "nan":
+        return None
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        return s[:19] if len(s) >= 19 else (s[:10] + " 00:00:00")
+    return s
+
+
+def _unmerge_ranges_touching_column(ws: Any, col_idx: int) -> None:
+    for mcr in list(ws.merged_cells.ranges):
+        if mcr.min_col <= col_idx <= mcr.max_col:
+            ws.unmerge_cells(str(mcr))
+
+
+def merge_excel_created_at_column(
+    excel_path: str,
+    sheet_name: Optional[str],
+    out_path: str,
+    all_sheets: bool,
+) -> None:
+    """
+    Gộp ô theo chiều dọc ở cột ngày tạo (created_at): cùng giá trị sau ffill (ô đầu block có ngày,
+    các dòng dưới trống = cùng ngày) -> merge thành một ô (giống merge thủ công trên Excel).
+    """
+    from openpyxl import load_workbook
+    from openpyxl.styles import Alignment
+
+    xls = pd.ExcelFile(excel_path)
+    target_sheets = set(xls.sheet_names) if all_sheets else {sheet_name or xls.sheet_names[0]}
+
+    wb = load_workbook(excel_path)
+    for sn in wb.sheetnames:
+        if sn not in target_sheets:
+            continue
+        ws = wb[sn]
+        col = _detect_created_at_column_1based(ws)
+        max_row = int(ws.max_row or 1)
+        if max_row < 2:
+            print(f"Sheet {sn!r}: không có dòng dữ liệu — bỏ qua gộp.")
+            continue
+
+        _unmerge_ranges_touching_column(ws, col)
+
+        vals: List[Any] = [ws.cell(row=r, column=col).value for r in range(2, max_row + 1)]
+        last: Any = None
+        effective: List[Any] = []
+        for v in vals:
+            if v is not None and not (isinstance(v, float) and pd.isna(v)):
+                s = str(v).strip()
+                if s and s.lower() != "nan":
+                    last = v
+            effective.append(last)
+
+        i = 0
+        n = len(effective)
+        merged_blocks = 0
+        while i < n:
+            if effective[i] is None:
+                i += 1
+                continue
+            key = _merge_date_key_for_cells(effective[i])
+            if key is None:
+                i += 1
+                continue
+            j = i + 1
+            while j < n and effective[j] is not None and _merge_date_key_for_cells(effective[j]) == key:
+                j += 1
+            excel_start = i + 2
+            excel_end = (j - 1) + 2
+            if excel_end > excel_start:
+                first_val: Any = None
+                for r in range(excel_start, excel_end + 1):
+                    cv = ws.cell(row=r, column=col).value
+                    if cv is not None and not (isinstance(cv, float) and pd.isna(cv)):
+                        ts = str(cv).strip()
+                        if ts and ts.lower() != "nan":
+                            first_val = cv
+                            break
+                if first_val is None:
+                    first_val = effective[i]
+                for r in range(excel_start + 1, excel_end + 1):
+                    ws.cell(row=r, column=col).value = None
+                top = ws.cell(row=excel_start, column=col)
+                top.value = first_val
+                top.alignment = Alignment(vertical="center", wrap_text=True)
+                ws.merge_cells(
+                    start_row=excel_start,
+                    start_column=col,
+                    end_row=excel_end,
+                    end_column=col,
+                )
+                merged_blocks += 1
+            i = j
+        print(f"Sheet {sn!r}: cột {col} — đã gộp {merged_blocks} khối ngày (logic ffill giống import).")
+
+    wb.save(out_path)
 
 
 def make_username_from_full_name(full_name: str) -> str:
@@ -700,6 +1164,9 @@ def import_excel(
         sheet_status = str_cell(get_row_field(row, "status_code", col_map, header_mode))
         customer_name = str_cell(get_row_field(row, "customer_name", col_map, header_mode))
         phone_raw = get_row_field(row, "phone", col_map, header_mode)
+        customer_name, phone_raw, extra_contact_note = apply_customer_column_split_for_import(
+            customer_name, phone_raw
+        )
         product_raw = str_cell(get_row_field(row, "product_text_raw", col_map, header_mode))
         issue_content = str_cell(get_row_field(row, "issue_content", col_map, header_mode))
         handling_for_ticket = str_cell(get_row_field(row, "handling", col_map, header_mode)) if header_mode else ""
@@ -748,6 +1215,8 @@ def import_excel(
             notes_lines: List[str] = []
             if notes_excel:
                 notes_lines.append(notes_excel)
+            if extra_contact_note:
+                notes_lines.append(extra_contact_note)
             if province_txt:
                 notes_lines.append(f"Tỉnh/Thành: {province_txt}")
             if not header_mode and sheet_status:
@@ -899,6 +1368,23 @@ def import_excel(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Import CSKH tickets from Excel to mysql4.cskh_tickets (map products from mysql3.products).")
     parser.add_argument("--excel", required=True, help="Path to Excel file")
+    parser.add_argument(
+        "--normalize-excel-out",
+        default=None,
+        metavar="OUT.xlsx",
+        help="Chuẩn hóa file: tách tên/SĐT, ghi SĐT vào cột phone nếu trống; sau đó (mặc định) gộp ô cột ngày tạo trên cùng file out. Không kết nối DB.",
+    )
+    parser.add_argument(
+        "--no-merge-created-at",
+        action="store_true",
+        help="Dùng với --normalize-excel-out: chỉ tách tên/SĐT, không gộp cột created_at.",
+    )
+    parser.add_argument(
+        "--merge-created-at-out",
+        default=None,
+        metavar="OUT.xlsx",
+        help="Gộp ô dọc cột ngày tạo (created_at / cột A legacy): các dòng trống dưới cùng một ngày (ffill) merge như Excel. Không kết nối DB.",
+    )
     parser.add_argument("--sheet", default=None, help="Excel sheet name (default: first sheet)")
     parser.add_argument(
         "--all-sheets",
@@ -913,6 +1399,33 @@ def main() -> None:
 
     if args.all_sheets and args.sheet is not None:
         raise SystemExit("Chỉ dùng một trong hai: --all-sheets hoặc --sheet, không dùng cùng lúc.")
+
+    if int(bool(args.normalize_excel_out)) + int(bool(args.merge_created_at_out)) > 1:
+        raise SystemExit("Chỉ dùng một trong: --normalize-excel-out hoặc --merge-created-at-out.")
+
+    if args.normalize_excel_out:
+        normalize_excel_customer_columns(
+            excel_path=args.excel,
+            sheet_name=args.sheet,
+            out_path=args.normalize_excel_out,
+            all_sheets=args.all_sheets,
+            also_merge_created_at=not args.no_merge_created_at,
+        )
+        if args.no_merge_created_at:
+            print(f"Đã ghi file chuẩn hóa (chưa gộp cột ngày): {args.normalize_excel_out}")
+        else:
+            print(f"Đã ghi file chuẩn hóa + đã gộp cột ngày tạo: {args.normalize_excel_out}")
+        return
+
+    if args.merge_created_at_out:
+        merge_excel_created_at_column(
+            excel_path=args.excel,
+            sheet_name=args.sheet,
+            out_path=args.merge_created_at_out,
+            all_sheets=args.all_sheets,
+        )
+        print(f"Đã ghi file đã gộp cột ngày: {args.merge_created_at_out}")
+        return
 
     load_dotenv()
 

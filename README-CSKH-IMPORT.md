@@ -78,3 +78,40 @@ python cskh_import_excel.py --excel "D:\path\to\file.xlsx" --sheet "T12026" --fa
 - Script tự tạo `cskh_receiving_departments` nếu chưa có phòng `--tech-department-name` (mặc định `Kỹ thuật`).
 - Script tự tạo `users` nếu không tìm thấy `full_name` tương ứng (introspect bảng `users`).
 - Tên sheet dạng `T{tháng}{năm}` (vd `T12026`) dùng để bù ngày khi ô ngày chỉ có số ngày hoặc định dạng ngắn.
+
+### Chuẩn hóa ô tên khách (cột C / `cskh_customers.name`) trước khi import
+
+Import và chế độ `--normalize-excel-out` đều tách/gom SĐT trong cùng một ô theo các kiểu sau (không đổi vị trí cột legacy):
+
+- SĐT cuối ô sau khoảng trắng/gạch; SĐT có khoảng trắng giữa các số (`091 8070836`).
+- Ngoặc quanh SĐT cuối ô: `Tên ( 0365… )`.
+- `+84…` / `084…` → quy về dạng `0xxxxxxxxx`.
+- 9 số di động thiếu số `0` đầu (vd `948283559` → `0948283559`), không áp dụng cho chuỗi nằm sau chữ `0` của SĐT 10 số.
+- Nhiều SĐT trong một ô (`/`, `-` giữa các khối) → cột SĐT ghi `số1; số2` (DB vẫn dùng số đầu để match); phần mô tả sau SĐT cuối (vd “Hỗ trợ máy lọc…”) → ghép vào `notes` nếu không nhận là tên phụ.
+- Tên phụ sau SĐT cuối (vd `… - Phan Thị Lệ`, `… / Nguyễn Thị Huế`) → gộp vào chuỗi tên (`Tên1 / Tên2`).
+
+Ghi file Excel đã tách **và** gộp ô cột ngày trên **cùng file** (không cần DB):
+
+```bash
+python cskh_import_excel.py --excel "file.xlsx" --normalize-excel-out "file_da_tach.xlsx"
+```
+
+Chỉ tách tên/SĐT, **không** gộp cột ngày:
+
+```bash
+python cskh_import_excel.py --excel "file.xlsx" --normalize-excel-out "file_da_tach.xlsx" --no-merge-created-at
+```
+
+### Gộp ô cột ngày (`created_at`) theo từng ngày (giống merge trên Excel)
+
+Ô đầu mỗi block có ngày, các dòng phía dưới để trống cột ngày = cùng ngày (giống `ffill` khi import). Lệnh sau **merge dọc** các ô đó trên đúng cột tiêu đề `cskh_tickets.created_at` / `tickets.created_at`; file legacy (9 cột A..I) thì gộp **cột A**.
+
+```bash
+python cskh_import_excel.py --excel "file.xlsx" --merge-created-at-out "file_da_gop_ngay.xlsx"
+```
+
+Không dùng chung một lúc với `--normalize-excel-out` (vì bước gộp ngày đã nằm trong `--normalize-excel-out` trừ khi có `--no-merge-created-at`). Ghi file mới (nên khác tên file nguồn để tránh lỗi khi file đang mở trên Windows).
+
+
+
+python cskh_import_excel.py --excel "TIẾP NHẬN CSKH 2026.xlsx" --normalize-excel-out "da_tach.xlsx"
