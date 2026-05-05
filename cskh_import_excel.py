@@ -34,6 +34,126 @@ def _normalize_text(s: Any) -> str:
     s = re.sub(r"[^a-z0-9]+", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
+def extract_model_tokens(text: str) -> List[str]:
+    if not text:
+        return []
+
+    raw = unidecode(str(text).upper())
+    parts = re.findall(r"[A-Z0-9]+", raw)
+
+    stopwords = {
+        "ROBOT",
+        "MAY",
+        "RUA",
+        "CHEN",
+        "CAY",
+        "LAU",
+        "NHA",
+        "MODEL",
+        "VIEW",
+        "HO",
+        "TRO",
+        "DA",
+        "VA",
+    }
+    blocked_prev_for_numeric = {"PIN", "MAH", "WH", "W", "V"}
+
+    candidates: List[str] = []
+    for i, p in enumerate(parts):
+        if not p or p in stopwords:
+            continue
+        if re.search(r"[A-Z]", p) and re.search(r"\d", p):
+            candidates.append(p)
+            continue
+        if p.isdigit() and 4 <= len(p) <= 6:
+            prev = parts[i - 1] if i > 0 else ""
+            if prev in blocked_prev_for_numeric:
+                continue
+            candidates.append(p)
+
+    return list(dict.fromkeys(candidates))
+
+
+def _expand_model_keys(model_text: str) -> List[str]:
+    """
+    Sinh tập key từ model để tăng khả năng map:
+    - token cơ bản (extract_model_tokens)
+    - bản compact bỏ ký tự đặc biệt
+    - phần số đuôi của token chữ+số (vd KUPPR8882 -> 8882)
+    """
+    out = extract_model_tokens(model_text)
+    raw = unidecode(str(model_text or "").upper())
+    compact = re.sub(r"[^A-Z0-9]+", "", raw)
+    if compact and re.search(r"\d", compact):
+        out.append(compact)
+    for tk in list(out):
+        m = re.search(r"(\d{4,6})$", tk)
+        if m:
+            out.append(m.group(1))
+    return list(dict.fromkeys([x for x in out if x]))
+
+
+def _has_accessory_intent(text: str) -> bool:
+    n = _normalize_text(text)
+    keys = (
+        "phu kien",
+        "pk",
+        "pin",
+        "hepa",
+        "loc",
+        "choi",
+        "khay",
+        "thung rac",
+        "hop rac",
+        "bo mam",
+        "man hinh",
+        "mach",
+        "mo to",
+        "ong",
+        "van",
+        "cam bien",
+    )
+    return any(_contains_keyword(n, k) for k in keys)
+
+
+def _is_accessory_product_name(name: str) -> bool:
+    n = _normalize_text(name)
+    keys = (
+        "phu kien",
+        "pk",
+        "pin",
+        "hepa",
+        "loc",
+        "choi",
+        "khay",
+        "thung rac",
+        "hop rac",
+        "mach",
+        "mo to",
+        "ong",
+        "van",
+        "cam bien",
+    )
+    return any(_contains_keyword(n, k) for k in keys)
+
+
+def _contains_keyword(normalized_text: str, keyword: str) -> bool:
+    if not normalized_text or not keyword:
+        return False
+    if " " in keyword:
+        return keyword in normalized_text
+    return re.search(rf"\b{re.escape(keyword)}\b", normalized_text) is not None
+
+
+def _semantic_name_score(query_text: str, candidate_name: str) -> int:
+    """
+    Điểm tương đồng ngữ nghĩa mức nhẹ để phân xử khi cùng model token.
+    """
+    q = _normalize_text(query_text)
+    c = _normalize_text(candidate_name)
+    if not q or not c:
+        return 0
+    return int(fuzz.token_set_ratio(q, c))
 
 def normalize_vn_phone(raw: Any) -> str:
     if raw is None:
@@ -334,6 +454,7 @@ def normalize_excel_customer_columns(
     out_path: str,
     all_sheets: bool,
     also_merge_created_at: bool = True,
+    product_index: Optional["ProductIndex"] = None,
 ) -> None:
     """
     Ghi file Excel mới: tách tên/SĐT ở cột khách hàng (legacy C hoặc cskh_customers.name),
@@ -363,6 +484,11 @@ def normalize_excel_customer_columns(
                 df.to_excel(writer, sheet_name=sn, index=False)
                 continue
 
+            product_names: List[str] = []
+            product_ids: List[Optional[int]] = []
+            product_match_types: List[str] = []
+            product_scores: List[int] = []
+
             for i in range(len(df)):
                 orig_c = df.iat[i, j_name]
                 orig_d = df.iat[i, j_phone] if j_phone < df.shape[1] else None
@@ -370,6 +496,23 @@ def normalize_excel_customer_columns(
                 new_c, new_d, _ = apply_customer_column_split_for_import(c0, orig_d)
                 df.iat[i, j_name] = new_c
                 df.iat[i, j_phone] = new_d
+
+                if product_index is not None:
+                    product_raw = get_product_raw_from_row(df.iloc[i], col_map, header_mode)
+                    pid, pname, pscore, ptype = match_product_v2(product_index, product_raw)
+                    product_names.append(pname or "")
+                    product_ids.append(pid if pid is not None else None)
+                    product_match_types.append(ptype)
+                    product_scores.append(int(pscore or 0))
+
+            if product_index is not None:
+                while len(product_names) < len(df):
+                    product_names.append("")
+                    product_ids.append(None)
+                    product_match_types.append("none")
+                    product_scores.append(0)
+                df["product_name_matched"] = product_names
+                df["product_id_matched"] = product_ids
 
             df.to_excel(writer, sheet_name=sn, index=False)
 
@@ -736,32 +879,60 @@ def ensure_user_by_full_name(engine4: Engine, full_name: str) -> int:
 class ProductIndex:
     choices: List[str]
     meta: Dict[str, Dict[str, Any]]
-
+    model_map: Dict[str, List[Dict[str, Any]]]
 
 def build_product_index(engine3: Engine) -> ProductIndex:
+    product_cols = set(get_table_columns(engine3, "products"))
+    has_view = "view" in product_cols
+    select_view = ", `view` AS view_flag" if has_view else ", 0 AS view_flag"
     sql = text(
-        """
-        SELECT id, product_name, name, model
+        f"""
+        SELECT id, product_name, name, model{select_view}
         FROM products
         WHERE status IS NULL OR status != 0
         """
     )
-    choices: List[str] = []
-    meta: Dict[str, Dict[str, Any]] = {}
+
+    choices = []
+    meta = {}
+    model_map: Dict[str, List[Dict[str, Any]]] = {}
+
     with engine3.begin() as conn:
         rows = conn.execute(sql).mappings().all()
+
     for r in rows:
         pid = int(r["id"])
+        model = unidecode(str(r.get("model") or "").strip().upper())
+        view_priority = 1 if int(r.get("view_flag") or 0) == 1 else 0
+
         fields = [r.get("product_name"), r.get("name"), r.get("model")]
-        labels = [str(x).strip() for x in fields if x is not None and str(x).strip()]
+        labels = [str(x).strip() for x in fields if x]
+
         if not labels:
             continue
-        # store a single canonical label for matching
+
         canonical = labels[0]
         key = f"{pid}:{canonical}"
+
         choices.append(key)
-        meta[key] = {"id": pid, "canonical": canonical, "all_labels": labels}
-    return ProductIndex(choices=choices, meta=meta)
+        meta[key] = {
+            "id": pid,
+            "canonical": canonical,
+            "all_labels": labels,
+            "view_priority": view_priority,
+        }
+
+        if model:
+            for tk in _expand_model_keys(model):
+                model_map.setdefault(tk, []).append(
+                    {
+                        "id": pid,
+                        "canonical": canonical,
+                        "view_priority": view_priority,
+                    }
+                )
+
+    return ProductIndex(choices=choices, meta=meta, model_map=model_map)
 
 
 def match_product(product_index: ProductIndex, raw_name: str) -> Tuple[Optional[int], Optional[str], int]:
@@ -781,6 +952,8 @@ def match_product(product_index: ProductIndex, raw_name: str) -> Tuple[Optional[
         for lb in labels:
             lb_n = _normalize_text(lb)
             best = max(best, fuzz.token_set_ratio(q, lb_n))
+        if int(product_index.meta[choice_key].get("view_priority") or 0) == 1:
+            best = min(100, best + 5)
         return best
 
     best = process.extractOne(query, product_index.choices, scorer=scorer)
@@ -791,6 +964,52 @@ def match_product(product_index: ProductIndex, raw_name: str) -> Tuple[Optional[
         return None, None, int(score)
     info = product_index.meta[choice_key]
     return int(info["id"]), str(info["canonical"]), int(score)
+
+def match_product_v2(product_index: ProductIndex, raw_name: str):
+    raw = (raw_name or "").strip()
+    if not raw:
+        return None, None, 0, "none"
+
+    tokens = extract_model_tokens(raw)
+
+    # ưu tiên exact model; nếu trùng nhiều product thì:
+    # 1) ưu tiên đúng kiểu sản phẩm (chính/phụ kiện theo ý định câu),
+    # 2) ưu tiên tên gần ngữ nghĩa câu nhập hơn,
+    # 3) ưu tiên view=1,
+    # 4) ưu tiên token chất lượng hơn và xuất hiện sớm hơn.
+    accessory_intent = _has_accessory_intent(raw) and len(tokens) <= 1
+    rank_by_key: Dict[str, Tuple[int, int, int, int, int]] = {}
+    # (accessory_fit, semantic_score, view_priority, token_quality, -token_index)
+    for tk in tokens:
+        rows = product_index.model_map.get(tk) or []
+        token_quality = 3 if (re.search(r"[A-Z]", tk) and re.search(r"\d", tk)) else 2
+        token_index = tokens.index(tk)
+        for p in rows:
+            key = f'{int(p["id"])}:{str(p["canonical"])}'
+            canonical = str(p.get("canonical") or "")
+            is_accessory = _is_accessory_product_name(canonical)
+            if accessory_intent:
+                accessory_fit = 1 if is_accessory else 0
+            else:
+                accessory_fit = 1 if not is_accessory else 0
+            semantic_score = _semantic_name_score(raw, canonical)
+            rank = (accessory_fit, semantic_score, int(p.get("view_priority", 0)), token_quality, -token_index)
+            prev = rank_by_key.get(key)
+            if prev is None or rank > prev:
+                rank_by_key[key] = rank
+    if rank_by_key:
+        best_key = sorted(rank_by_key.items(), key=lambda kv: kv[1], reverse=True)[0][0]
+        info = product_index.meta.get(best_key)
+        if info:
+            return int(info["id"]), str(info["canonical"]), 100, "exact_model"
+
+    # fallback fuzzy
+    pid, name, score = match_product(product_index, raw)
+
+    if pid:
+        return pid, name, score, "fuzzy"
+
+    return None, None, 0, "none"
 
 
 def parse_sheet_month_year(sheet_name: str) -> Tuple[int, int]:
@@ -965,6 +1184,29 @@ def get_row_field(row: pd.Series, field: str, col_map: Dict[str, int], header_mo
     return row.iloc[j]
 
 
+def get_product_raw_from_row(row: pd.Series, col_map: Dict[str, int], header_mode: bool) -> str:
+    """
+    Lấy text sản phẩm để match theo mức ưu tiên:
+    1) cột product_text_raw (nếu có)
+    2) cột issue_content (sheet chuẩn hóa nhưng không tách product riêng)
+    3) cột E legacy (index 4)
+    """
+    if header_mode:
+        j_prod = col_map.get("product_text_raw")
+        if j_prod is not None and j_prod < len(row):
+            v = str_cell(row.iloc[j_prod])
+            if v:
+                return v
+        j_issue = col_map.get("issue_content")
+        if j_issue is not None and j_issue < len(row):
+            v = str_cell(row.iloc[j_issue])
+            if v:
+                return v
+    if len(row) > 4:
+        return str_cell(row.iloc[4])
+    return ""
+
+
 def str_cell(v: Any) -> str:
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return ""
@@ -1105,6 +1347,7 @@ def import_excel(
     sheet_name: Optional[str],
     start_row: int,
     dry_run: bool,
+    export_product_check: Optional[str],
     fallback_created_by: Optional[int],
     tech_department_name: str,
 ) -> None:
@@ -1132,6 +1375,7 @@ def import_excel(
     product_index = build_product_index(engine3)
 
     imported = 0
+    export_rows = []
     skipped = 0
     errors: List[str] = []
 
@@ -1167,7 +1411,7 @@ def import_excel(
         customer_name, phone_raw, extra_contact_note = apply_customer_column_split_for_import(
             customer_name, phone_raw
         )
-        product_raw = str_cell(get_row_field(row, "product_text_raw", col_map, header_mode))
+        product_raw = get_product_raw_from_row(row, col_map, header_mode)
         issue_content = str_cell(get_row_field(row, "issue_content", col_map, header_mode))
         handling_for_ticket = str_cell(get_row_field(row, "handling", col_map, header_mode)) if header_mode else ""
         resolution_for_solution = (
@@ -1202,6 +1446,15 @@ def import_excel(
             ]
         ):
             skipped += 1
+            export_rows.append(
+                {
+                    "product_raw": product_raw,
+                    "matched_name": None,
+                    "matched_id": None,
+                    "match_type": "skipped_empty",
+                    "score": 0,
+                }
+            )
             continue
 
         try:
@@ -1210,8 +1463,16 @@ def import_excel(
             # Status mapping (cột trạng thái / cskh_status.code): xem map_workflow_status()
             workflow_status = map_workflow_status(sheet_status)
 
-            product_id, product_canonical, product_score = match_product(product_index, product_raw)
-
+            product_id, product_canonical, product_score, match_type = match_product_v2(product_index, product_raw)
+            export_rows.append(
+                {
+                    "product_raw": product_raw,
+                    "matched_name": product_canonical,
+                    "matched_id": product_id,
+                    "match_type": match_type,
+                    "score": product_score,
+                }
+            )
             notes_lines: List[str] = []
             if notes_excel:
                 notes_lines.append(notes_excel)
@@ -1285,7 +1546,7 @@ def import_excel(
             if "workflow_status" in ticket_cols and "workflow_status" not in ticket_payload:
                 raise RuntimeError("cskh_tickets requires workflow_status but script couldn't set it")
 
-            if dry_run:
+            if dry_run or export_product_check:
                 imported += 1
                 continue
 
@@ -1353,7 +1614,38 @@ def import_excel(
             imported += 1
 
         except Exception as e:
+            export_rows.append(
+                {
+                    "product_raw": product_raw,
+                    "matched_name": None,
+                    "matched_id": None,
+                    "match_type": "error",
+                    "score": 0,
+                }
+            )
             errors.append(f"Row {i+2}: {e}")  # +2 because header=0 and 1-indexed Excel rows
+
+    if export_product_check:
+        df_export = df.copy()
+        if len(export_rows) < len(df_export):
+            export_rows.extend(
+                {
+                    "product_raw": "",
+                    "matched_name": None,
+                    "matched_id": None,
+                    "match_type": "not_processed",
+                    "score": 0,
+                }
+                for _ in range(len(df_export) - len(export_rows))
+            )
+        if len(export_rows) > len(df_export):
+            export_rows = export_rows[: len(df_export)]
+
+        df_export["product_name_matched"] = [r["matched_name"] for r in export_rows]
+        df_export["product_id_matched"] = [r["matched_id"] for r in export_rows]
+        df_export.to_excel(export_product_check, index=False)
+        print(f"Exported: {export_product_check}")
+        return
 
     print(f"Imported rows: {imported}")
     print(f"Skipped empty rows: {skipped}")
@@ -1380,6 +1672,11 @@ def main() -> None:
         help="Dùng với --normalize-excel-out: chỉ tách tên/SĐT, không gộp cột created_at.",
     )
     parser.add_argument(
+        "--with-product-match",
+        action="store_true",
+        help="Dùng với --normalize-excel-out: thêm cột product_name_matched/product_id_matched/product_match_* vào file out.",
+    )
+    parser.add_argument(
         "--merge-created-at-out",
         default=None,
         metavar="OUT.xlsx",
@@ -1393,6 +1690,7 @@ def main() -> None:
     )
     parser.add_argument("--start-row", type=int, default=0, help="0-based data row index (excluding header). Default 0.")
     parser.add_argument("--dry-run", action="store_true", help="Parse and validate only; do not write to DB")
+    parser.add_argument("--export-product-check", default=None, help="Xuất Excel để kiểm tra product match")
     parser.add_argument("--fallback-created-by", type=int, default=None, help="User id to use when receiver is empty or receiver is 'Kỹ thuật'")
     parser.add_argument("--tech-department-name", default="Kỹ thuật", help="cskh_receiving_departments.description to use/create for 'Kỹ thuật'")
     args = parser.parse_args()
@@ -1404,12 +1702,18 @@ def main() -> None:
         raise SystemExit("Chỉ dùng một trong: --normalize-excel-out hoặc --merge-created-at-out.")
 
     if args.normalize_excel_out:
+        p_index: Optional[ProductIndex] = None
+        if args.with_product_match:
+            load_dotenv()
+            engine3 = create_engine(build_mysql_url("DB3"), pool_pre_ping=True, future=True)
+            p_index = build_product_index(engine3)
         normalize_excel_customer_columns(
             excel_path=args.excel,
             sheet_name=args.sheet,
             out_path=args.normalize_excel_out,
             all_sheets=args.all_sheets,
             also_merge_created_at=not args.no_merge_created_at,
+            product_index=p_index,
         )
         if args.no_merge_created_at:
             print(f"Đã ghi file chuẩn hóa (chưa gộp cột ngày): {args.normalize_excel_out}")
@@ -1440,6 +1744,7 @@ def main() -> None:
             sheet_name=sheet,
             start_row=args.start_row,
             dry_run=args.dry_run,
+            export_product_check=args.export_product_check,
             fallback_created_by=args.fallback_created_by,
             tech_department_name=args.tech_department_name,
         )

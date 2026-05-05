@@ -115,3 +115,12 @@ Không dùng chung một lúc với `--normalize-excel-out` (vì bước gộp n
 
 
 python cskh_import_excel.py --excel "TIẾP NHẬN CSKH 2026.xlsx" --normalize-excel-out "da_tach.xlsx"
+
+Ưu tiên lấy view = 1 cho tôi
+Máy rửa chén 80365
+Cây lau nhà 2405 MODEL KU FLL2405
+Robot 8882 và 3006 mà lại ra pin 5200 robot 8882
+Nồi chiên hấp 2228 => nó là model KU PCL2228 tên là Nồi chiên không dầu kết hợp hấp KU PCL2228
+
+
+python .\cskh_import_excel.py --excel ".\da_tach.xlsx" --all-sheets --normalize-excel-out ".\da_tach_all_in_one_new.xlsx" --with-product-match
