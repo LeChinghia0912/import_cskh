@@ -16,6 +16,33 @@ from sqlalchemy.engine import Engine
 from unidecode import unidecode
 
 
+def load_resume_checkpoint(path: str) -> Dict[str, int]:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if isinstance(obj, dict):
+            out: Dict[str, int] = {}
+            for k, v in obj.items():
+                if isinstance(k, str):
+                    try:
+                        out[k] = max(0, int(v))
+                    except Exception:
+                        continue
+            return out
+    except Exception:
+        pass
+    return {}
+
+
+def save_resume_checkpoint(path: str, data: Dict[str, int]) -> None:
+    if not path:
+        return
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
 def _env(name: str, default: Optional[str] = None) -> str:
     v = os.getenv(name, default)
     if v is None or v == "":
@@ -1012,6 +1039,14 @@ def match_product_v2(product_index: ProductIndex, raw_name: str):
     return None, None, 0, "none"
 
 
+def get_product_canonical_by_id(product_index: ProductIndex, product_id: int) -> Optional[str]:
+    pid = int(product_id)
+    for info in product_index.meta.values():
+        if int(info.get("id") or 0) == pid:
+            return str(info.get("canonical") or "") or None
+    return None
+
+
 def parse_sheet_month_year(sheet_name: str) -> Tuple[int, int]:
     s = str(sheet_name or "").strip().replace(" ", "")
     m = re.match(r"^[Tt](\d{1,2})(\d{4})$", s)
@@ -1113,6 +1148,8 @@ def classify_excel_header(label: str) -> Optional[str]:
         return "notes"
     if low == "cskh_tickets.product_text":
         return "product_text_raw"
+    if low == "product_id_matched":
+        return "product_id_matched"
     n = _normalize_text(t)
     if "tinh" in n and "thanh" in n:
         return "province"
@@ -1205,6 +1242,23 @@ def get_product_raw_from_row(row: pd.Series, col_map: Dict[str, int], header_mod
     if len(row) > 4:
         return str_cell(row.iloc[4])
     return ""
+
+
+def get_product_id_override_from_row(row: pd.Series, col_map: Dict[str, int], header_mode: bool) -> Optional[int]:
+    """
+    Ưu tiên lấy product_id từ file Excel đã annotate:
+    - Header mode: cột `product_id_matched` (nếu có)
+    - Legacy/không header: cột N (index 13) theo yêu cầu vận hành hiện tại
+    """
+    if header_mode:
+        j = col_map.get("product_id_matched")
+        if j is not None and j < len(row):
+            pid = parse_optional_int_id(row.iloc[j])
+            if pid is not None:
+                return pid
+    if len(row) > 13:
+        return parse_optional_int_id(row.iloc[13])
+    return None
 
 
 def str_cell(v: Any) -> str:
@@ -1346,6 +1400,8 @@ def import_excel(
     excel_path: str,
     sheet_name: Optional[str],
     start_row: int,
+    resume_state: Optional[Dict[str, int]],
+    resume_checkpoint_path: Optional[str],
     dry_run: bool,
     export_product_check: Optional[str],
     fallback_created_by: Optional[int],
@@ -1397,7 +1453,13 @@ def import_excel(
     )
     completed_status_id = int(completed_row["id"]) if completed_row else None
 
-    for i in range(start_row, len(df)):
+    effective_start_row = max(0, int(start_row))
+    if resume_state is not None:
+        effective_start_row = max(effective_start_row, int(resume_state.get(actual_sheet_name, 0)))
+    if effective_start_row > 0:
+        print(f"Resume sheet {actual_sheet_name!r} from row index {effective_start_row}")
+
+    for i in range(effective_start_row, len(df)):
         row = df.iloc[i]
 
         created_at = parse_created_at(
@@ -1455,6 +1517,10 @@ def import_excel(
                     "score": 0,
                 }
             )
+            if resume_state is not None:
+                resume_state[actual_sheet_name] = i + 1
+                if resume_checkpoint_path:
+                    save_resume_checkpoint(resume_checkpoint_path, resume_state)
             continue
 
         try:
@@ -1463,7 +1529,13 @@ def import_excel(
             # Status mapping (cột trạng thái / cskh_status.code): xem map_workflow_status()
             workflow_status = map_workflow_status(sheet_status)
 
+            product_id_excel = get_product_id_override_from_row(row, col_map, header_mode)
             product_id, product_canonical, product_score, match_type = match_product_v2(product_index, product_raw)
+            if product_id_excel is not None:
+                product_id = int(product_id_excel)
+                product_canonical = get_product_canonical_by_id(product_index, product_id)
+                match_type = "excel_col_n"
+                product_score = 100
             export_rows.append(
                 {
                     "product_raw": product_raw,
@@ -1548,6 +1620,10 @@ def import_excel(
 
             if dry_run or export_product_check:
                 imported += 1
+                if resume_state is not None:
+                    resume_state[actual_sheet_name] = i + 1
+                    if resume_checkpoint_path:
+                        save_resume_checkpoint(resume_checkpoint_path, resume_state)
                 continue
 
             with engine4.begin() as conn:
@@ -1612,6 +1688,10 @@ def import_excel(
                     conn.execute(text(f"INSERT INTO cskh_ticket_transfers ({col_sql_t}) VALUES ({val_sql_t})"), transfer_payload)
 
             imported += 1
+            if resume_state is not None:
+                resume_state[actual_sheet_name] = i + 1
+                if resume_checkpoint_path:
+                    save_resume_checkpoint(resume_checkpoint_path, resume_state)
 
         except Exception as e:
             export_rows.append(
@@ -1689,6 +1769,12 @@ def main() -> None:
         help="Import từng sheet trong file; sheet tên không đúng dạng T{tháng}{năm} (vd T12025) sẽ bị bỏ qua",
     )
     parser.add_argument("--start-row", type=int, default=0, help="0-based data row index (excluding header). Default 0.")
+    parser.add_argument(
+        "--resume-checkpoint",
+        default=None,
+        metavar="checkpoint.json",
+        help="File checkpoint để import tiếp phần còn dở theo từng sheet. Nếu có file thì sẽ tự bỏ qua các dòng đã xử lý.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Parse and validate only; do not write to DB")
     parser.add_argument("--export-product-check", default=None, help="Xuất Excel để kiểm tra product match")
     parser.add_argument("--fallback-created-by", type=int, default=None, help="User id to use when receiver is empty or receiver is 'Kỹ thuật'")
@@ -1735,6 +1821,7 @@ def main() -> None:
 
     engine3 = create_engine(build_mysql_url("DB3"), pool_pre_ping=True, future=True)
     engine4 = create_engine(build_mysql_url("DB4"), pool_pre_ping=True, future=True)
+    resume_state = load_resume_checkpoint(args.resume_checkpoint) if args.resume_checkpoint else None
 
     def run_one(sheet: Optional[str]) -> None:
         import_excel(
@@ -1743,6 +1830,8 @@ def main() -> None:
             excel_path=args.excel,
             sheet_name=sheet,
             start_row=args.start_row,
+            resume_state=resume_state,
+            resume_checkpoint_path=args.resume_checkpoint,
             dry_run=args.dry_run,
             export_product_check=args.export_product_check,
             fallback_created_by=args.fallback_created_by,
